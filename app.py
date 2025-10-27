@@ -1,7 +1,7 @@
 import os
 import logging
 import re
-import requests
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from downloader import DownloadManager
@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 class TelegramDownloaderBot:
     def __init__(self):
         self.download_manager = DownloadManager()
+        self.download_tasks = {}
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send welcome message when command /start is issued."""
@@ -44,13 +45,15 @@ class TelegramDownloaderBot:
     async def handle_text_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text files containing download links."""
         try:
+            await update.message.reply_text("📥 फाइल प्राप्त हुई, प्रोसेसिंग...")
+            
             file = await update.message.document.get_file()
             file_path = f"temp_{update.message.document.file_name}"
             
             await file.download_to_drive(file_path)
             
             # Read the file content
-            with open(file_path, 'r', encoding='utf-8') as f:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
             
             # Parse links
@@ -63,8 +66,8 @@ class TelegramDownloaderBot:
             
             await update.message.reply_text(f"✅ {len(links)} लिंक मिले! डाउनलोड शुरू कर रहा हूं...")
             
-            # Start download process
-            await self.start_download(update, context, links)
+            # Start download process in background
+            asyncio.create_task(self.start_download(update, context, links))
             
             # Clean up
             os.remove(file_path)
@@ -83,23 +86,21 @@ class TelegramDownloaderBot:
             return
         
         await update.message.reply_text(f"✅ {len(links)} लिंक मिले! डाउनलोड शुरू कर रहा हूं...")
-        await self.start_download(update, context, links)
+        asyncio.create_task(self.start_download(update, context, links))
 
     def extract_links(self, text):
         """Extract PDF and video links from text."""
-        # Pattern for both PDF and video links
-        pattern = r'https?://[^\s<>"]+?\.(pdf|PDF|mp4|MP4|mp3|MP3|mov|MOV|avi|AVI)'
-        links = re.findall(pattern, text)
-        
-        # Also get all URLs and filter
+        # Pattern for URLs
         url_pattern = r'https?://[^\s<>"]+'
         all_urls = re.findall(url_pattern, text)
         
         valid_urls = []
         for url in all_urls:
-            if any(ext in url.lower() for ext in ['.pdf', '.mp4', '.mp3', '.mov', '.avi']):
+            # Check for file extensions
+            if any(ext in url.lower() for ext in ['.pdf', '.mp4', '.mp3', '.mov', '.avi', '.mkv', '.webm']):
                 valid_urls.append(url)
-            elif 'utkarshapp.com' in url or 'cloudfront.net' in url:
+            # Check for utkarshapp domains
+            elif any(domain in url for domain in ['utkarshapp.com', 'cloudfront.net']):
                 valid_urls.append(url)
         
         return list(set(valid_urls))  # Remove duplicates
@@ -116,32 +117,55 @@ class TelegramDownloaderBot:
             # Start download
             total_files = len(links)
             downloaded_files = []
+            failed_files = []
             
             for i, link in enumerate(links, 1):
                 try:
-                    await update.message.reply_text(f"📥 डाउनलोड हो रहा है ({i}/{total_files}):\n{link}")
+                    status_msg = await update.message.reply_text(
+                        f"📥 डाउनलोड हो रहा है ({i}/{total_files}):\n"
+                        f"`{link}`",
+                        parse_mode='Markdown'
+                    )
                     
                     filename = await self.download_manager.download_file(link, download_dir)
                     
                     if filename:
                         downloaded_files.append(filename)
-                        await update.message.reply_text(f"✅ सफलतापूर्वक डाउनलोड हुआ: {filename}")
+                        await status_msg.edit_text(
+                            f"✅ सफलतापूर्वक डाउनलोड हुआ ({i}/{total_files}):\n"
+                            f"`{filename}`",
+                            parse_mode='Markdown'
+                        )
                     else:
-                        await update.message.reply_text(f"❌ डाउनलोड विफल: {link}")
+                        failed_files.append(link)
+                        await status_msg.edit_text(
+                            f"❌ डाउनलोड विफल ({i}/{total_files}):\n"
+                            f"`{link}`",
+                            parse_mode='Markdown'
+                        )
+                        
+                    # Small delay to avoid rate limiting
+                    await asyncio.sleep(1)
                         
                 except Exception as e:
                     logger.error(f"Error downloading {link}: {e}")
+                    failed_files.append(link)
                     await update.message.reply_text(f"❌ त्रुटि: {link}")
             
             # Send completion message
-            if downloaded_files:
-                await update.message.reply_text(
-                    f"🎉 डाउनलोड पूरा हुआ!\n"
-                    f"✅ सफल: {len(downloaded_files)}/{total_files} फाइलें\n"
-                    f"📁 लोकेशन: {download_dir}"
-                )
-            else:
-                await update.message.reply_text("❌ कोई भी फाइल डाउनलोड नहीं हो सकी।")
+            completion_text = (
+                f"🎉 डाउनलोड पूरा हुआ!\n"
+                f"✅ सफल: {len(downloaded_files)}/{total_files} फाइलें\n"
+                f"❌ विफल: {len(failed_files)}/{total_files} फाइलें\n"
+                f"📁 लोकेशन: `{download_dir}`"
+            )
+            
+            if failed_files:
+                completion_text += f"\n\n❌ विफल लिंक्स:\n" + "\n".join(failed_files[:5])
+                if len(failed_files) > 5:
+                    completion_text += f"\n... और {len(failed_files) - 5} और"
+            
+            await update.message.reply_text(completion_text, parse_mode='Markdown')
                 
         except Exception as e:
             logger.error(f"Download process error: {e}")
@@ -174,19 +198,24 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_direct_links))
 
     # Start the Bot
-    port = int(os.environ.get('PORT', 8443))
-    webhook_url = os.environ.get('WEBHOOK_URL', '')
-    
-    if webhook_url:
+    if os.environ.get('RENDER'):
         # Production (with webhook)
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{webhook_url}/{BOT_TOKEN}"
-        )
+        port = int(os.environ.get('PORT', 8443))
+        webhook_url = os.environ.get('WEBHOOK_URL', '')
+        
+        if webhook_url:
+            application.run_webhook(
+                listen="0.0.0.0",
+                port=port,
+                url_path=BOT_TOKEN,
+                webhook_url=f"{webhook_url}/{BOT_TOKEN}"
+            )
+        else:
+            # Use polling if no webhook URL
+            application.run_polling()
     else:
         # Development (polling)
+        print("🤖 Bot started with polling...")
         application.run_polling()
 
 if __name__ == '__main__':
