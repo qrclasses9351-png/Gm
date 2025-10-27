@@ -13,7 +13,8 @@ class DownloadManager:
         
     async def get_session(self):
         if self.session is None:
-            self.session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=300)
+            self.session = aiohttp.ClientSession(timeout=timeout)
         return self.session
 
     async def download_file(self, url, download_dir):
@@ -21,18 +22,24 @@ class DownloadManager:
         try:
             session = await self.get_session()
             
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as response:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            async with session.get(url, headers=headers) as response:
                 if response.status == 200:
                     # Get filename from URL or Content-Disposition header
-                    filename = self.get_filename(url, response)
+                    filename = await self.get_filename(url, response)
                     filepath = os.path.join(download_dir, filename)
                     
                     # Download file
+                    total_size = 0
                     async with aiofiles.open(filepath, 'wb') as file:
-                        async for chunk in response.content.iter_chunked(1024):
+                        async for chunk in response.content.iter_chunked(8192):
                             await file.write(chunk)
+                            total_size += len(chunk)
                     
-                    logger.info(f"Downloaded: {filename}")
+                    logger.info(f"Downloaded: {filename} ({total_size} bytes)")
                     return filename
                 else:
                     logger.error(f"HTTP {response.status} for URL: {url}")
@@ -42,14 +49,14 @@ class DownloadManager:
             logger.error(f"Download error for {url}: {e}")
             return None
 
-    def get_filename(self, url, response):
+    async def get_filename(self, url, response):
         """Extract filename from URL or response headers."""
         # Try to get filename from Content-Disposition header
         content_disposition = response.headers.get('Content-Disposition', '')
         if 'filename=' in content_disposition:
             filename = re.findall('filename="?([^"]+)"?', content_disposition)
             if filename:
-                return filename[0]
+                return self.sanitize_filename(filename[0])
         
         # Try to get filename from URL
         parsed_url = urlparse(url)
@@ -57,16 +64,26 @@ class DownloadManager:
         if '/' in url_path:
             filename = url_path.split('/')[-1]
             if filename and '.' in filename:
-                return filename
+                return self.sanitize_filename(filename)
         
-        # Generate a filename based on content type
+        # Generate a filename based on content type and URL
         content_type = response.headers.get('Content-Type', '')
-        if 'pdf' in content_type.lower():
-            return f"document_{hash(url)}.pdf"
-        elif 'video' in content_type.lower():
-            return f"video_{hash(url)}.mp4"
+        url_hash = hash(url) % 10000  # Simple hash
+        
+        if 'pdf' in content_type.lower() or '.pdf' in url.lower():
+            return f"document_{url_hash}.pdf"
+        elif 'video' in content_type.lower() or any(ext in url.lower() for ext in ['.mp4', '.mov', '.avi']):
+            return f"video_{url_hash}.mp4"
         else:
-            return f"file_{hash(url)}.bin"
+            return f"file_{url_hash}.bin"
+
+    def sanitize_filename(self, filename):
+        """Sanitize filename to remove invalid characters."""
+        # Remove invalid characters for filenames
+        invalid_chars = '<>:"/\\|?*'
+        for char in invalid_chars:
+            filename = filename.replace(char, '_')
+        return filename.strip()
 
     async def close(self):
         """Close the session."""
