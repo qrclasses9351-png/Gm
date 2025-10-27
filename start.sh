@@ -1,1 +1,2 @@
-python-3.11.0
+#!/bin/bash
+python app.py
